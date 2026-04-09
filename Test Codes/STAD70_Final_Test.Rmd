@@ -1,0 +1,296 @@
+---
+title: "STAD70_Strategy_2_Final"
+output:
+  pdf_document: default
+  html_document: default
+date: "2026-04-05"
+---
+
+``````{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(zoo)
+library(ggplot2)
+library(here)
+
+Sys.setenv(TZ = "America/New_York")
+
+#parameters from grid search on training data
+
+CHECK_TIME        <- "11:00:00"
+ENTRY_TIME        <- "11:01:00"
+TIME_EXIT         <- "14:30:00"
+FINAL_TIME        <- "15:59:00"
+VOL_COMPRESS_MULT <- 0.9
+VOL_EXPAND_MULT   <- 1.5
+STOP_MULT         <- 0.8
+VOL_LOOKBACK_DAYS <- 20L
+SLIPPAGE_PER_LEG  <- 0.02
+
+
+# spy_path = "spy_etf_train.csv"
+# opt_path = "spy_opt_train.csv"
+
+spy_path = "spy_etf_test.csv"
+opt_path = "spy_opt_test.csv"
+
+
+#load test data
+spy_df <- read_csv(here(spy_path)) %>%
+  mutate(timestamp  = with_tz(timestamp, tzone = "America/New_York")) %>%
+  arrange(timestamp) %>%
+  mutate(trade_date = as.Date(timestamp, tz = "America/New_York"),
+         log_ret    = log(close / open))
+
+opt_df <- read_csv(here(opt_path)) %>%
+  mutate(timestamp  = with_tz(timestamp, tzone = "America/New_York")) %>%
+  arrange(timestamp) %>%
+  mutate(trade_date = as.Date(timestamp, tz = "America/New_York"))
+
+all_days <- sort(unique(spy_df$trade_date))
+cat("Test days:", length(all_days), "\n")
+
+get_opt_price <- function(type_char, strike_val, ts, tol_mins = 5) {
+  ts_end <- ts + minutes(tol_mins)
+  tmp <- opt_df %>%
+    filter(type == type_char, strike == strike_val,
+           timestamp >= ts, timestamp <= ts_end) %>%
+    arrange(timestamp)
+  if (nrow(tmp) == 0) return(NA_real_)
+  px <- tmp$vwap[1]
+  if (is.na(px)) px <- tmp$open[1]
+  as.numeric(px)
+}
+
+apply_slippage <- function(price, legs = 1, side = c("sell", "buy")) {
+  side <- match.arg(side)
+  adj  <- SLIPPAGE_PER_LEG * legs
+  if (side == "sell") return(max(price - adj, 0))
+  return(price + adj)
+}
+
+compute_daily_features <- function(days) {
+  feats <- map_dfr(days, function(d) {
+    day_data <- spy_df %>% filter(trade_date == d) %>% arrange(timestamp)
+    if (nrow(day_data) < 200) {
+      return(tibble(trade_date = d,
+                    sigma15 = NA_real_, sigma60 = NA_real_,
+                    vol15 = NA_real_, vol60 = NA_real_,
+                    spy_ref = NA_real_, ts_ref = as.POSIXct(NA)))
+    }
+    sigma15 <- rollapply(day_data$log_ret, width = 15, FUN = sd,  fill = NA, align = "right")
+    sigma60 <- rollapply(day_data$log_ret, width = 60, FUN = sd,  fill = NA, align = "right")
+    vol15   <- rollapply(day_data$volume,  width = 15, FUN = sum, fill = NA, align = "right")
+    vol60   <- rollapply(day_data$volume,  width = 60, FUN = sum, fill = NA, align = "right")
+    day_data <- day_data %>%
+      mutate(sigma15 = sigma15, sigma60 = sigma60, vol15 = vol15, vol60 = vol60)
+    target_ts <- ymd_hms(paste(d, CHECK_TIME), tz = "America/New_York")
+    idx <- which.min(abs(as.numeric(day_data$timestamp) - as.numeric(target_ts)))
+    tibble(trade_date = d,
+           sigma15 = day_data$sigma15[idx], sigma60 = day_data$sigma60[idx],
+           vol15   = day_data$vol15[idx],   vol60   = day_data$vol60[idx],
+           spy_ref = day_data$open[idx],    ts_ref  = day_data$timestamp[idx])
+  })
+  feats %>%
+    arrange(trade_date) %>%
+    mutate(med30_sigma60 = rollapply(sigma60, width = VOL_LOOKBACK_DAYS,
+                                     FUN = function(x) median(x, na.rm = TRUE),
+                                     fill = NA, align = "right"))
+}
+
+simulate_day <- function(d, daily_feats) {
+  feats <- daily_feats %>% filter(trade_date == d)
+  if (nrow(feats) == 0) return(NULL)
+  if (any(is.na(feats$sigma15), is.na(feats$sigma60), is.na(feats$med30_sigma60),
+          is.na(feats$vol15), is.na(feats$vol60), is.na(feats$spy_ref))) return(NULL)
+
+  # entry signal
+  condA <- feats$sigma15 < VOL_COMPRESS_MULT * feats$sigma60
+  condB <- feats$sigma60 < feats$med30_sigma60
+  if (!(condA && condB)) return(NULL)
+
+  entry_ts     <- ymd_hms(paste(d, ENTRY_TIME), tz = "America/New_York")
+  time_exit_ts <- ymd_hms(paste(d, TIME_EXIT),  tz = "America/New_York")
+  final_ts     <- ymd_hms(paste(d, FINAL_TIME), tz = "America/New_York")
+
+  # pick ATM strike
+  strikes_today <- opt_df %>% filter(trade_date == d) %>% distinct(strike) %>% pull(strike)
+  if (length(strikes_today) == 0) return(NULL)
+  K <- strikes_today[which.min(abs(strikes_today - feats$spy_ref))]
+
+  # entry prices (vwap)
+  call_entry_raw <- get_opt_price("C", K, entry_ts)
+  put_entry_raw  <- get_opt_price("P", K, entry_ts)
+  if (any(is.na(call_entry_raw), is.na(put_entry_raw))) return(NULL)
+
+  call_entry <- apply_slippage(call_entry_raw, legs = 1, side = "sell")
+  put_entry  <- apply_slippage(put_entry_raw,  legs = 1, side = "sell")
+  premium         <- call_entry + put_entry
+  premium_dollars <- 100 * premium
+
+  # intraday loop
+  day_data <- spy_df %>%
+    filter(trade_date == d, timestamp >= entry_ts) %>%
+    arrange(timestamp) %>%
+    mutate(sigma15 = rollapply(log_ret, width = 15, FUN = sd, fill = NA, align = "right"),
+           sigma60 = rollapply(log_ret, width = 60, FUN = sd, fill = NA, align = "right"))
+  if (nrow(day_data) < 50) return(NULL)
+
+  for (i in seq_len(nrow(day_data))) {
+    ts <- day_data$timestamp[i]
+    S  <- day_data$close[i]
+
+    # time exit
+    if (ts >= time_exit_ts) {
+      ce_raw <- get_opt_price("C", K, ts)
+      pe_raw <- get_opt_price("P", K, ts)
+      if (!any(is.na(ce_raw), is.na(pe_raw))) {
+        ce <- apply_slippage(ce_raw, 1, "buy")
+        pe <- apply_slippage(pe_raw, 1, "buy")
+        exit_cost <- 100 * (ce + pe)
+        return(tibble(trade_date = d, strike = K,
+                      entry_ts = entry_ts, exit_ts = ts,
+                      entry_premium = premium, exit_cost = exit_cost / 100,
+                      call_entry_vwap = call_entry_raw, put_entry_vwap = put_entry_raw,
+                      call_exit_vwap  = ce_raw,         put_exit_vwap  = pe_raw,
+                      pnl = premium_dollars - exit_cost, exit_reason = "TIME_EXIT"))
+      }
+    }
+
+    # stop loss
+    if (!is.na(S) && abs(S - K) > STOP_MULT * premium) {
+      ce_raw <- get_opt_price("C", K, ts)
+      pe_raw <- get_opt_price("P", K, ts)
+      if (!any(is.na(ce_raw), is.na(pe_raw))) {
+        ce <- apply_slippage(ce_raw, 1, "buy")
+        pe <- apply_slippage(pe_raw, 1, "buy")
+        exit_cost <- 100 * (ce + pe)
+        return(tibble(trade_date = d, strike = K,
+                      entry_ts = entry_ts, exit_ts = ts,
+                      entry_premium = premium, exit_cost = exit_cost / 100,
+                      call_entry_vwap = call_entry_raw, put_entry_vwap = put_entry_raw,
+                      call_exit_vwap  = ce_raw,         put_exit_vwap  = pe_raw,
+                      pnl = premium_dollars - exit_cost, exit_reason = "STOP_LOSS"))
+      }
+    }
+
+    # vol expansion exit
+    s15 <- day_data$sigma15[i]; s60 <- day_data$sigma60[i]
+    if (!is.na(s15) && !is.na(s60) && s15 > VOL_EXPAND_MULT * s60) {
+      ce_raw <- get_opt_price("C", K, ts)
+      pe_raw <- get_opt_price("P", K, ts)
+      if (!any(is.na(ce_raw), is.na(pe_raw))) {
+        ce <- apply_slippage(ce_raw, 1, "buy")
+        pe <- apply_slippage(pe_raw, 1, "buy")
+        exit_cost <- 100 * (ce + pe)
+        return(tibble(trade_date = d, strike = K,
+                      entry_ts = entry_ts, exit_ts = ts,
+                      entry_premium = premium, exit_cost = exit_cost / 100,
+                      call_entry_vwap = call_entry_raw, put_entry_vwap = put_entry_raw,
+                      call_exit_vwap  = ce_raw,         put_exit_vwap  = pe_raw,
+                      pnl = premium_dollars - exit_cost, exit_reason = "VOL_EXPANSION"))
+      }
+    }
+
+    if (ts >= final_ts) break
+  }
+
+  # hold to expiry
+  close_row <- spy_df %>%
+    filter(trade_date == d) %>%
+    arrange(timestamp) %>%
+    filter(format(timestamp, "%H:%M:%S") == FINAL_TIME)
+  if (nrow(close_row) == 0)
+    close_row <- spy_df %>% filter(trade_date == d) %>% arrange(timestamp) %>% slice_tail(n = 1)
+
+  S_T         <- close_row$close[1]
+  call_payoff <- max(S_T - K, 0)
+  put_payoff  <- max(K - S_T, 0)
+
+  tibble(trade_date = d, strike = K,
+         entry_ts = entry_ts, exit_ts = final_ts,
+         entry_premium = premium, exit_cost = call_payoff + put_payoff,
+         call_entry_vwap = call_entry_raw, put_entry_vwap = put_entry_raw,
+         call_exit_vwap  = call_payoff,    put_exit_vwap  = put_payoff,
+         pnl = 100 * (premium - call_payoff - put_payoff),
+         exit_reason = "HOLD_TO_EXPIRY")
+}
+
+daily_feats <- compute_daily_features(all_days)
+
+trade_results <- map_dfr(all_days, ~simulate_day(.x, daily_feats)) %>%
+  arrange(trade_date) %>%
+  mutate(cum_pnl = cumsum(pnl))
+
+cat("Trades:", nrow(trade_results), "\n")
+cat("Total P&L: $", round(sum(trade_results$pnl), 2), "\n")
+
+cashflow_rows <- map_dfr(seq_len(nrow(trade_results)), function(i) {
+  r <- trade_results[i, ]
+  K <- r$strike
+
+  entry_call <- tibble(
+    timestamp  = r$entry_ts,
+    asset      = paste0("Call K=", K),
+    position   = -1,
+    vwap_price = r$call_entry_vwap,
+    cashflow   = 100 * apply_slippage(r$call_entry_vwap, 1, "sell")
+  )
+  entry_put <- tibble(
+    timestamp  = r$entry_ts,
+    asset      = paste0("Put K=", K),
+    position   = -1,
+    vwap_price = r$put_entry_vwap,
+    cashflow   = 100 * apply_slippage(r$put_entry_vwap, 1, "sell")
+  )
+
+  exit_call <- tibble(
+    timestamp  = r$exit_ts,
+    asset      = paste0("Call K=", K),
+    position   = +1,
+    vwap_price = r$call_exit_vwap,
+    cashflow   = -100 * apply_slippage(r$call_exit_vwap, 1, "buy")
+  )
+  exit_put <- tibble(
+    timestamp  = r$exit_ts,
+    asset      = paste0("Put K=", K),
+    position   = +1,
+    vwap_price = r$put_exit_vwap,
+    cashflow   = -100 * apply_slippage(r$put_exit_vwap, 1, "buy")
+  )
+
+  bind_rows(entry_call, entry_put, exit_call, exit_put)
+})
+
+cashflow_table <- cashflow_rows %>%
+  arrange(timestamp) %>%
+  mutate(timestamp = format(timestamp, "%Y-%m-%d %H:%M"),
+         cum_pnl = cumsum(cashflow))
+
+write_csv(cashflow_table, "cashflow_table_Short_Strad.csv")
+cat("Saved cashflow_table.csv\n")
+
+# cumulative P&L plot
+p <- ggplot(trade_results, aes(x = trade_date, y = cum_pnl)) +
+  geom_line(color = "steelblue", linewidth = 1) +
+  geom_point(aes(color = pnl > 0), size = 2) +
+  scale_color_manual(values = c("TRUE" = "darkgreen", "FALSE" = "darkred"),
+                     labels  = c("TRUE" = "Win", "FALSE" = "Loss"), name = "") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "gray40") +
+  labs(title   = "Out-of-Sample Cumulative P&L: Short ATM 0DTE Straddle",
+       x       = "Date",
+       y       = "Cumulative P&L ($)",
+       caption = paste0("Trades: ", nrow(trade_results),
+                        " | Total P&L: $", round(sum(trade_results$pnl), 0),
+                        " | Win Rate: ", round(mean(trade_results$pnl > 0) * 100, 1), "%")) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "top", plot.caption = element_text(size = 8))
+
+ggsave("cum_pnl_plot_Short_Strad.png", plot = p, width = 10, height = 5, dpi = 150)
+cat("Saved cum_pnl_plot.png\n")
+
+```

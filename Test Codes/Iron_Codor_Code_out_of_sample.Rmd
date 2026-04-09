@@ -1,0 +1,636 @@
+---
+title: "Object 2 - Iron Condor"
+author: 
+date: "2026-03-23"
+output:
+  html_document:
+    df_print: paged
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+rm(list = ls())
+library(tidyverse)
+library(lubridate)
+library(purrr)
+library(here)
+```
+
+```{r}
+Sys.setenv(TZ = "America/New_York")
+
+# spy_file <- "spy_etf_train.csv"
+# opt_file <- "spy_opt_train.csv"
+
+spy_file <- "spy_etf_test.csv"
+opt_file <- "spy_opt_test.csv"
+
+spy_df <- read_csv(here(spy_file), show_col_types = FALSE) %>%
+  mutate(
+    timestamp = with_tz(timestamp, "America/New_York"),
+    date = as.Date(timestamp)
+  ) %>%
+  arrange(timestamp)
+
+opt_df <- read_csv(here(opt_file), show_col_types = FALSE) %>%
+  mutate(
+    timestamp = with_tz(timestamp, "America/New_York"),
+    type = toupper(type),
+    date = as.Date(timestamp)
+  ) %>%
+  arrange(timestamp, type, strike)
+
+entry_time_fixed      <- "10:30:00"
+force_exit_time       <- "15:00:00"
+exit_check_every_mins <- 20
+
+wing_width <- 1
+
+min_credit  <- 0.02
+iv_rv_ratio <- 1.00
+r           <- 0.05
+
+take_profit_pct <- 0.50
+stop_loss_mult  <- 1.50
+exit_on_touch   <- TRUE
+```
+
+
+
+```{r}
+get_time_slice <- function(df, start_time, end_time) {
+  df %>%
+    filter(
+      format(timestamp, "%H:%M:%S") >= start_time,
+      format(timestamp, "%H:%M:%S") <= end_time
+    )
+}
+
+calc_log_rv <- function(prices) {
+  if (length(prices) < 2) return(NA_real_)
+  log_ret <- diff(log(prices))
+  sqrt(sum(log_ret^2, na.rm = TRUE))
+}
+
+get_nearest_snapshot <- function(df, trade_date, target_time) {
+  if (nrow(df) == 0) return(df[0, ])
+
+  target_dt <- ymd_hms(
+    paste(as.character(trade_date), target_time),
+    tz = "America/New_York"
+  )
+
+  df %>%
+    mutate(min_diff = abs(as.numeric(difftime(timestamp, target_dt, units = "mins")))) %>%
+    filter(min_diff == min(min_diff, na.rm = TRUE)) %>%
+    select(-min_diff)
+}
+
+calc_intraday_T <- function(current_time, market_close = "16:00:00") {
+  fake_date <- "2026-01-01"
+
+  t1 <- ymd_hms(paste(fake_date, current_time), tz = "America/New_York")
+  t2 <- ymd_hms(paste(fake_date, market_close), tz = "America/New_York")
+
+  remaining_minutes <- as.numeric(difftime(t2, t1, units = "mins"))
+  remaining_minutes <- max(remaining_minutes, 1)
+
+  remaining_minutes / (252 * 390)
+}
+
+pick_nearest_strike <- function(df, target_strike, opt_type) {
+  df %>%
+    filter(type == opt_type) %>%
+    mutate(dist = abs(strike - target_strike)) %>%
+    arrange(dist, strike) %>%
+    slice(1) %>%
+    select(-dist)
+}
+
+make_time_grid <- function(start_time, end_time, by_mins) {
+  fake_date <- "2026-01-01"
+  t1 <- ymd_hms(paste(fake_date, start_time), tz = "America/New_York")
+  t2 <- ymd_hms(paste(fake_date, end_time), tz = "America/New_York")
+
+  grid <- seq(t1, t2, by = paste(by_mins, "mins"))
+  format(grid, "%H:%M:%S")
+}
+
+shift_time_str <- function(time_str, mins_shift) {
+  fake_date <- "2026-01-01"
+  t <- ymd_hms(paste(fake_date, time_str), tz = "America/New_York")
+  t_new <- t + minutes(mins_shift)
+  format(t_new, "%H:%M:%S")
+}
+```
+
+```{r}
+# implied volatility
+bs_price <- function(S, K, r, T, sigma, type) {
+
+  d1 <- (log(S / K) + (r + 0.5 * sigma^2) * T) / (sigma * sqrt(T))
+  d2 <- d1 - sigma * sqrt(T)
+
+  if (type == "C") {
+    S * pnorm(d1) - K * exp(-r * T) * pnorm(d2)
+  } else if (type == "P") {
+    K * exp(-r * T) * pnorm(-d2) - S * pnorm(-d1)
+  }
+}
+
+bs_implied_vol <- function(option_price, S, K, r, T, type) {
+
+  iv_fun <- function(sigma) {
+    bs_price(S, K, r, T, sigma, type) - option_price
+  }
+  tryCatch(
+    uniroot(iv_fun, lower = 1e-4, upper = 3)$root,
+    error = function(e) NA_real_
+  )
+}
+
+add_bs_iv <- function(df, S, r, T) {
+  df %>%
+    mutate(
+      iv_bs = pmap_dbl(
+        list(close, strike, type),
+        function(close, strike, type) {
+          bs_implied_vol(
+            option_price = close,
+            S = S,
+            K = strike,
+            r = r,
+            T = T,
+            type = type
+          )
+        }
+      )
+    )
+}
+```
+
+```{r}
+# condor pricing
+get_leg_price <- function(snapshot, strike_i, type_i) {
+  row_i <- snapshot %>%
+    filter(strike == strike_i, type == type_i)
+
+  if (nrow(row_i) == 0) return(NA_real_)
+  row_i$close[1]
+}
+
+get_condor_exit_debit <- function(snapshot, K_sp, K_lp, K_sc, K_lc) {
+  sp <- get_leg_price(snapshot, K_sp, "P")
+  lp <- get_leg_price(snapshot, K_lp, "P")
+  sc <- get_leg_price(snapshot, K_sc, "C")
+  lc <- get_leg_price(snapshot, K_lc, "C")
+
+  if (any(is.na(c(sp, lp, sc, lc)))) return(NA_real_)
+
+  # buy back shorts, sell longs
+  sp - lp + sc - lc
+}
+```
+
+```{r}
+
+# 7. ENTRY CHECK AT FIXED TIME
+check_entry_at_time <- function(test_day, time_i, spy_day, opt_day) {
+  start_60 <- shift_time_str(time_i, -60)
+  start_30 <- shift_time_str(time_i, -30)
+  spy_60 <- get_time_slice(spy_day, start_60, time_i)
+  spy_30 <- get_time_slice(spy_day, start_30, time_i)
+  rv_60 <- calc_log_rv(spy_60$close)
+  rv_30 <- calc_log_rv(spy_30$close)
+
+  vol_cooling <- rv_30 < rv_60
+
+  spy_entry <- get_nearest_snapshot(spy_day, test_day, time_i)
+
+  S_entry <- spy_entry$close[1]
+
+  opt_entry <- get_nearest_snapshot(opt_day, test_day, time_i)
+
+  available_strikes <- sort(unique(opt_entry$strike))
+  if (length(available_strikes) < 4) return(NULL)
+
+  T_remain <- calc_intraday_T(time_i, "16:00:00")
+
+  # use BSM to compute IV for every option at entry
+  opt_entry <- add_bs_iv(opt_entry, S = S_entry, r = r, T = T_remain)
+
+  # pick short strikes
+  target_put_strike  <- S_entry * (1 - rv_60*sqrt(390/60))
+  target_call_strike <- S_entry * (1 + rv_60*sqrt(390/60))
+
+  short_put  <- pick_nearest_strike(opt_entry, target_put_strike, "P")
+  short_call <- pick_nearest_strike(opt_entry, target_call_strike, "C")
+
+  if (nrow(short_put) == 0 || nrow(short_call) == 0) return(NULL)
+
+  K_sp <- short_put$strike[1]
+  K_sc <- short_call$strike[1]
+
+# pick long strikes
+  strike_diffs <- diff(available_strikes)
+  strike_step <- median(strike_diffs[strike_diffs > 0], na.rm = TRUE)
+  if (!is.finite(strike_step)) strike_step <- 1
+
+  target_long_put  <- K_sp - wing_width * strike_step
+  target_long_call <- K_sc + wing_width * strike_step
+
+  long_put  <- pick_nearest_strike(opt_entry, target_long_put, "P")
+  long_call <- pick_nearest_strike(opt_entry, target_long_call, "C")
+
+  if (nrow(long_put) == 0 || nrow(long_call) == 0) return(NULL)
+
+  K_lp <- long_put$strike[1]
+  K_lc <- long_call$strike[1]
+
+  if (K_lp >= K_sp) return(NULL)
+  if (K_lc <= K_sc) return(NULL)
+
+  # use BSM IV of the actual short legs
+  iv_short_put  <- short_put$iv_bs[1]
+  iv_short_call <- short_call$iv_bs[1]
+  iv_long_put   <- long_put$iv_bs[1]
+  iv_long_call  <- long_call$iv_bs[1]
+
+  if (any(!is.finite(c(iv_short_put, iv_short_call, iv_long_put, iv_long_call)))) {
+    return(NULL)
+  }
+
+  avg_short_iv <- mean(c(iv_short_put, iv_short_call))
+  avg_long_iv  <- mean(c(iv_long_put, iv_long_call))
+
+  # entry signal:
+  # 1) vol cooling
+  # 2) actual short-leg IV is rich relative to realized vol
+  # 3) short-leg IV should also be >= long-leg IV
+  signal_trade <- vol_cooling &&
+    (avg_short_iv > iv_rv_ratio * rv_60*sqrt(390*252/ 60)) &&
+    (avg_short_iv >= avg_long_iv)
+
+  if (!signal_trade) return(NULL)
+
+  premium_short_put  <- short_put$close[1]
+  premium_short_call <- short_call$close[1]
+  premium_long_put   <- long_put$close[1]
+  premium_long_call  <- long_call$close[1]
+
+  entry_credit <- premium_short_put + premium_short_call -
+    premium_long_put - premium_long_call
+
+  if (is.na(entry_credit) || entry_credit < min_credit) return(NULL)
+
+  tibble(
+    date = test_day,
+    entry_time = time_i,
+    S_entry = S_entry,
+    rv_60 = rv_60,
+    rv_30 = rv_30,
+    short_put_iv = iv_short_put,
+    short_call_iv = iv_short_call,
+    avg_short_iv = avg_short_iv,
+    avg_long_iv = avg_long_iv,
+    short_put = K_sp,
+    long_put = K_lp,
+    short_call = K_sc,
+    long_call = K_lc,
+    short_put_price = premium_short_put,
+    long_put_price = premium_long_put,
+    short_call_price = premium_short_call,
+    long_call_price = premium_long_call,
+    entry_credit = entry_credit
+  )
+}
+
+find_fixed_entry <- function(test_day, spy_day, opt_day) {
+  out <- check_entry_at_time(
+    test_day = test_day,
+    time_i = entry_time_fixed,
+    spy_day = spy_day,
+    opt_day = opt_day
+  )
+
+  if (is.null(out) || nrow(out) == 0) return(NULL)
+  out
+}
+```
+
+```{r}
+# Exit signal
+
+
+find_dynamic_exit <- function(entry_row, test_day, spy_day, opt_day) {
+  entry_time_i <- entry_row$entry_time[1]
+
+  exit_grid <- make_time_grid(
+    start_time = shift_time_str(entry_time_i, exit_check_every_mins),
+    end_time   = force_exit_time,
+    by_mins    = exit_check_every_mins
+  )
+
+  K_sp <- entry_row$short_put[1]
+  K_lp <- entry_row$long_put[1]
+  K_sc <- entry_row$short_call[1]
+  K_lc <- entry_row$long_call[1]
+  entry_credit <- entry_row$entry_credit[1]
+
+  for (time_i in exit_grid) {
+    spy_now <- get_nearest_snapshot(spy_day, test_day, time_i)
+    opt_now <- get_nearest_snapshot(opt_day, test_day, time_i)
+    S_now <- spy_now$close[1]
+    exit_debit <- get_condor_exit_debit(opt_now, K_sp, K_lp, K_sc, K_lc)
+    if (is.na(exit_debit)) next
+
+    pnl_now <- entry_credit - exit_debit
+
+    take_profit_hit <- pnl_now >= take_profit_pct * entry_credit
+    stop_loss_hit <- pnl_now <= -stop_loss_mult * entry_credit
+    touch_hit <- exit_on_touch && (S_now <= K_sp || S_now >= K_sc)
+
+    if (take_profit_hit || stop_loss_hit || touch_hit) {
+      reason <- case_when(
+        take_profit_hit ~ "take_profit",
+        stop_loss_hit   ~ "stop_loss",
+        touch_hit       ~ "short_strike_touch",
+        TRUE            ~ "other"
+      )
+
+      return(
+        tibble(
+          exit_time = time_i,
+          S_exit = S_now,
+          exit_debit = exit_debit,
+          pnl = pnl_now,
+          exit_reason = reason
+        )
+      )
+    }
+  }
+
+  spy_force <- get_nearest_snapshot(spy_day, test_day, force_exit_time)
+  opt_force <- get_nearest_snapshot(opt_day, test_day, force_exit_time)
+
+  S_force <- spy_force$close[1]
+  exit_debit_force <- get_condor_exit_debit(opt_force, K_sp, K_lp, K_sc, K_lc)
+
+  pnl_force <- entry_credit - exit_debit_force
+
+  tibble(
+    exit_time = force_exit_time,
+    S_exit = S_force,
+    exit_debit = exit_debit_force,
+    pnl = pnl_force,
+    exit_reason = "forced_exit"
+  )
+}
+
+
+# run one day
+run_condor_one_day_simple <- function(test_day, spy_df, opt_df) {
+  spy_day <- spy_df %>% filter(date == test_day)
+  opt_day <- opt_df %>% filter(date == test_day)
+
+  entry_row <- find_fixed_entry(test_day, spy_day, opt_day)
+  if (is.null(entry_row) || nrow(entry_row) == 0) return(NULL)
+
+  exit_row <- find_dynamic_exit(entry_row, test_day, spy_day, opt_day)
+  if (is.null(exit_row) || nrow(exit_row) == 0) return(NULL)
+
+  bind_cols(entry_row, exit_row) %>%
+    mutate(
+      hold_minutes = as.numeric(
+        difftime(
+          ymd_hms(paste(as.character(date), exit_time), tz = "America/New_York"),
+          ymd_hms(paste(as.character(date), entry_time), tz = "America/New_York"),
+          units = "mins"
+        )
+      ),
+      pnl = pnl * 100,
+    entry_credit = entry_credit * 100,
+    exit_debit = exit_debit * 100
+    )
+}
+
+
+# backtest
+trading_days <- sort(unique(spy_df$date))
+
+trade_results <- map_dfr(
+  trading_days,
+  ~ run_condor_one_day_simple(.x, spy_df, opt_df)
+)
+```
+
+```{r}
+# result
+if (nrow(trade_results) > 0) {
+
+  trade_results <- trade_results %>%
+    arrange(date) %>%
+    mutate(cumulative_pnl = cumsum(pnl))
+
+  print(
+    trade_results %>%
+      select(
+        date, entry_time, exit_time, exit_reason, pnl,
+        short_put, long_put, short_call, long_call,
+        avg_short_iv, avg_long_iv,
+        entry_credit, exit_debit,hold_minutes
+      ) %>%
+      mutate(across(where(is.numeric), ~ round(., 4)))
+  )
+
+  cat("\n================ Strategy Summary ================\n")
+  cat("Total trades:", nrow(trade_results), "\n")
+  cat("Total P&L: $", round(sum(trade_results$pnl, na.rm = TRUE), 2), "\n")
+  cat("Average P&L per trade: $", round(mean(trade_results$pnl, na.rm = TRUE), 2), "\n")
+  cat("Median P&L per trade: $", round(median(trade_results$pnl, na.rm = TRUE), 2), "\n")
+  cat("Win rate:", round(mean(trade_results$pnl > 0, na.rm = TRUE) * 100, 2), "%\n")
+  cat("Best trade: $", round(max(trade_results$pnl, na.rm = TRUE), 2), "\n")
+  cat("Worst trade: $", round(min(trade_results$pnl, na.rm = TRUE), 2), "\n")
+
+  if (sd(trade_results$pnl, na.rm = TRUE) > 0) {
+    cat("Sharpe ratio:", round(
+      mean(trade_results$pnl, na.rm = TRUE) / sd(trade_results$pnl, na.rm = TRUE), 4
+    ), "\n")
+  }
+
+  p1 <- ggplot(trade_results, aes(x = date, y = cumulative_pnl)) +
+    geom_line(linewidth = 1) +
+    geom_point(size = 2) +
+    geom_hline(yintercept = 0, linetype = "dashed") +
+    labs(
+      title = "Cumulative P&L",
+      x = "Date",
+      y = "Cumulative P&L"
+    ) +
+    theme_minimal()
+
+  p2 <- ggplot(trade_results, aes(x = date, y = pnl, fill = pnl > 0)) +
+  geom_col() +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_fill_manual(
+    values = c("TRUE" = "green", "FALSE" = "red"),
+    labels = c("FALSE" = "Loss", "TRUE" = "Profit"),
+    name = "Trade Result"
+  ) +
+  labs(
+    title = "P&L by Trade Day",
+    x = "Date",
+    y = "P&L"
+  ) +
+  theme_minimal()
+
+  print(p1)
+  print(p2)
+
+} else {
+  cat("No trades executed.\n")
+  cat("Try adjusting entry_time_fixed, exit_check_every_mins, iv_rv_ratio, or min_credit.\n")
+}
+```
+
+
+```{r}
+# Cashflow table
+generate_cashflow_table <- function(trade_results, opt_df) {
+
+  if (is.null(trade_results) || nrow(trade_results) == 0) {
+    return(tibble(
+      timestamp = as.POSIXct(character()),
+      asset = character(),
+      position = integer(),
+      vwap_price = numeric(),
+      cashflow = numeric(),
+      cum_pnl = numeric()
+    ))
+  }
+
+  get_leg_vwap <- function(trade_date, trade_time, strike_i, type_i) {
+    snap <- opt_df %>%
+      filter(date == trade_date) %>%
+      get_nearest_snapshot(trade_date, trade_time)
+
+    row_i <- snap %>%
+      filter(strike == strike_i, type == type_i)
+
+    if (nrow(row_i) == 0) return(NA_real_)
+
+    row_i$close[1]
+  }
+
+  cashflow_list <- vector("list", nrow(trade_results))
+
+  for (i in seq_len(nrow(trade_results))) {
+
+    tr <- trade_results[i, ]
+
+    trade_date <- tr$date[1]
+    entry_time <- tr$entry_time[1]
+    exit_time  <- tr$exit_time[1]
+
+    entry_ts <- ymd_hms(
+      paste(as.character(trade_date), entry_time),
+      tz = "America/New_York"
+    )
+
+    exit_ts <- ymd_hms(
+      paste(as.character(trade_date), exit_time),
+      tz = "America/New_York"
+    )
+
+    K_sp <- tr$short_put[1]
+    K_lp <- tr$long_put[1]
+    K_sc <- tr$short_call[1]
+    K_lc <- tr$long_call[1]
+
+    # Format timestamps as ET strings (Excel-friendly, matches LSTM script)
+    entry_ts_str <- format(entry_ts, "%Y-%m-%d %H:%M")
+    exit_ts_str  <- format(exit_ts,  "%Y-%m-%d %H:%M")
+
+    # Entry: sell short legs, buy long legs
+    entry_rows <- tibble(
+      timestamp = c(entry_ts_str, entry_ts_str, entry_ts_str, entry_ts_str),
+      asset = c(
+        paste0("Put K=", K_sp),
+        paste0("Put K=", K_lp),
+        paste0("Call K=", K_sc),
+        paste0("Call K=", K_lc)
+      ),
+      position = c(
+        -1,  # sell short put
+        +1,  # buy long put
+        -1,  # sell short call
+        +1   # buy long call
+      ),
+      vwap_price = c(
+        get_leg_vwap(trade_date, entry_time, K_sp, "P"),
+        get_leg_vwap(trade_date, entry_time, K_lp, "P"),
+        get_leg_vwap(trade_date, entry_time, K_sc, "C"),
+        get_leg_vwap(trade_date, entry_time, K_lc, "C")
+      )
+    )
+
+    # Exit: buy back short legs, sell long legs
+    exit_rows <- tibble(
+      timestamp = c(exit_ts_str, exit_ts_str, exit_ts_str, exit_ts_str),
+      asset = c(
+        paste0("Put K=", K_sp),
+        paste0("Put K=", K_lp),
+        paste0("Call K=", K_sc),
+        paste0("Call K=", K_lc)
+      ),
+      position = c(
+        +1,  # buy back short put
+        -1,  # sell long put
+        +1,  # buy back short call
+        -1   # sell long call
+      ),
+      vwap_price = c(
+        get_leg_vwap(trade_date, exit_time, K_sp, "P"),
+        get_leg_vwap(trade_date, exit_time, K_lp, "P"),
+        get_leg_vwap(trade_date, exit_time, K_sc, "C"),
+        get_leg_vwap(trade_date, exit_time, K_lc, "C")
+      )
+    )
+
+    trade_cf <- bind_rows(entry_rows, exit_rows) %>%
+      mutate(
+        cashflow = -position * vwap_price * 100
+      )
+
+    cashflow_list[[i]] <- trade_cf
+  }
+
+  cashflow_table <- bind_rows(cashflow_list) %>%
+    arrange(timestamp) %>%
+    mutate(
+      cum_pnl = cumsum(cashflow)
+    )
+
+  cashflow_table
+}
+
+cashflow_table <- generate_cashflow_table(trade_results, opt_df)
+
+#save
+output_path <- file.path(here("cashflow_table_Iron_Condor.csv"))
+write_csv(cashflow_table, output_path)
+
+print(head(cashflow_table))
+
+ggsave(
+  filename = here("cumulative_pnl_Iron_Condor.png"),
+  plot = p1,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+
+```
+
